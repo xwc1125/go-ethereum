@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math/big"
+	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -36,55 +36,66 @@ var (
 
 const (
 	// ReceiptStatusFailed is the status code of a transaction if execution failed.
-	ReceiptStatusFailed = uint(0)
+	ReceiptStatusFailed = uint64(0)
 
 	// ReceiptStatusSuccessful is the status code of a transaction if execution succeeded.
-	ReceiptStatusSuccessful = uint(1)
+	ReceiptStatusSuccessful = uint64(1)
 )
 
 // Receipt represents the results of a transaction.
 type Receipt struct {
 	// Consensus fields
-	PostState         []byte   `json:"root"`
-	Status            uint     `json:"status"`
-	CumulativeGasUsed *big.Int `json:"cumulativeGasUsed" gencodec:"required"`
-	Bloom             Bloom    `json:"logsBloom"         gencodec:"required"`
-	Logs              []*Log   `json:"logs"              gencodec:"required"`
+	PostState         []byte `json:"root"`
+	Status            uint64 `json:"status"`
+	CumulativeGasUsed uint64 `json:"cumulativeGasUsed" gencodec:"required"`
+	Bloom             Bloom  `json:"logsBloom"         gencodec:"required"`
+	Logs              []*Log `json:"logs"              gencodec:"required"`
 
 	// Implementation fields (don't reorder!)
 	TxHash          common.Hash    `json:"transactionHash" gencodec:"required"`
 	ContractAddress common.Address `json:"contractAddress"`
-	GasUsed         *big.Int       `json:"gasUsed" gencodec:"required"`
+	GasUsed         uint64         `json:"gasUsed" gencodec:"required"`
 }
 
 type receiptMarshaling struct {
 	PostState         hexutil.Bytes
-	Status            hexutil.Uint
-	CumulativeGasUsed *hexutil.Big
-	GasUsed           *hexutil.Big
+	Status            hexutil.Uint64
+	CumulativeGasUsed hexutil.Uint64
+	GasUsed           hexutil.Uint64
 }
 
 // receiptRLP is the consensus encoding of a receipt.
 type receiptRLP struct {
 	PostStateOrStatus []byte
-	CumulativeGasUsed *big.Int
+	CumulativeGasUsed uint64
 	Bloom             Bloom
 	Logs              []*Log
 }
 
+// receiptStorageRLP is the storage encoding of a receipt.
 type receiptStorageRLP struct {
 	PostStateOrStatus []byte
-	CumulativeGasUsed *big.Int
+	CumulativeGasUsed uint64
+	TxHash            common.Hash
+	ContractAddress   common.Address
+	Logs              []*LogForStorage
+	GasUsed           uint64
+}
+
+// LegacyReceiptStorageRLP is the previous storage encoding of a receipt including some unnecessary fields.
+type LegacyReceiptStorageRLP struct {
+	PostStateOrStatus []byte
+	CumulativeGasUsed uint64
 	Bloom             Bloom
 	TxHash            common.Hash
 	ContractAddress   common.Address
 	Logs              []*LogForStorage
-	GasUsed           *big.Int
+	GasUsed           uint64
 }
 
 // NewReceipt creates a barebone transaction receipt, copying the init fields.
-func NewReceipt(root []byte, failed bool, cumulativeGasUsed *big.Int) *Receipt {
-	r := &Receipt{PostState: common.CopyBytes(root), CumulativeGasUsed: new(big.Int).Set(cumulativeGasUsed)}
+func NewReceipt(root []byte, failed bool, cumulativeGasUsed uint64) *Receipt {
+	r := &Receipt{PostState: common.CopyBytes(root), CumulativeGasUsed: cumulativeGasUsed}
 	if failed {
 		r.Status = ReceiptStatusFailed
 	} else {
@@ -137,12 +148,16 @@ func (r *Receipt) statusEncoding() []byte {
 	return r.PostState
 }
 
-// String implements the Stringer interface.
-func (r *Receipt) String() string {
-	if len(r.PostState) == 0 {
-		return fmt.Sprintf("receipt{status=%d cgas=%v bloom=%x logs=%v}", r.Status, r.CumulativeGasUsed, r.Bloom, r.Logs)
+// Size returns the approximate memory used by all internal contents. It is used
+// to approximate and limit the memory consumption of various caches.
+func (r *Receipt) Size() common.StorageSize {
+	size := common.StorageSize(unsafe.Sizeof(*r)) + common.StorageSize(len(r.PostState))
+
+	size += common.StorageSize(len(r.Logs)) * common.StorageSize(unsafe.Sizeof(Log{}))
+	for _, log := range r.Logs {
+		size += common.StorageSize(len(log.Topics)*common.HashLength + len(log.Data))
 	}
-	return fmt.Sprintf("receipt{med=%x cgas=%v bloom=%x logs=%v}", r.PostState, r.CumulativeGasUsed, r.Bloom, r.Logs)
+	return size
 }
 
 // ReceiptForStorage is a wrapper around a Receipt that flattens and parses the
@@ -155,7 +170,6 @@ func (r *ReceiptForStorage) EncodeRLP(w io.Writer) error {
 	enc := &receiptStorageRLP{
 		PostStateOrStatus: (*Receipt)(r).statusEncoding(),
 		CumulativeGasUsed: r.CumulativeGasUsed,
-		Bloom:             r.Bloom,
 		TxHash:            r.TxHash,
 		ContractAddress:   r.ContractAddress,
 		Logs:              make([]*LogForStorage, len(r.Logs)),
@@ -170,19 +184,34 @@ func (r *ReceiptForStorage) EncodeRLP(w io.Writer) error {
 // DecodeRLP implements rlp.Decoder, and loads both consensus and implementation
 // fields of a receipt from an RLP stream.
 func (r *ReceiptForStorage) DecodeRLP(s *rlp.Stream) error {
-	var dec receiptStorageRLP
-	if err := s.Decode(&dec); err != nil {
+	blob, err := s.Raw()
+	if err != nil {
 		return err
+	}
+	var dec receiptStorageRLP
+	if err := rlp.DecodeBytes(blob, &dec); err != nil {
+		var sdec LegacyReceiptStorageRLP
+		if err := rlp.DecodeBytes(blob, &sdec); err != nil {
+			return err
+		}
+		dec.PostStateOrStatus = common.CopyBytes(sdec.PostStateOrStatus)
+		dec.CumulativeGasUsed = sdec.CumulativeGasUsed
+		dec.TxHash = sdec.TxHash
+		dec.ContractAddress = sdec.ContractAddress
+		dec.Logs = sdec.Logs
+		dec.GasUsed = sdec.GasUsed
 	}
 	if err := (*Receipt)(r).setStatus(dec.PostStateOrStatus); err != nil {
 		return err
 	}
 	// Assign the consensus fields
-	r.CumulativeGasUsed, r.Bloom = dec.CumulativeGasUsed, dec.Bloom
+	r.CumulativeGasUsed = dec.CumulativeGasUsed
 	r.Logs = make([]*Log, len(dec.Logs))
 	for i, log := range dec.Logs {
 		r.Logs[i] = (*Log)(log)
 	}
+
+	r.Bloom = CreateBloom(Receipts{(*Receipt)(r)})
 	// Assign the implementation fields
 	r.TxHash, r.ContractAddress, r.GasUsed = dec.TxHash, dec.ContractAddress, dec.GasUsed
 	return nil
