@@ -193,7 +193,7 @@ func HexToAddress(s string) Address { return BytesToAddress(FromHex(s)) }
 // IsHexAddress verifies whether a string can represent a valid hex-encoded
 // Ethereum address or not.
 func IsHexAddress(s string) bool {
-	if hasHexPrefix(s) {
+	if has0xPrefix(s) {
 		s = s[2:]
 	}
 	return len(s) == 2*AddressLength && isHex(s)
@@ -201,9 +201,6 @@ func IsHexAddress(s string) bool {
 
 // Bytes gets the string representation of the underlying address.
 func (a Address) Bytes() []byte { return a[:] }
-
-// Big converts an address to a big integer.
-func (a Address) Big() *big.Int { return new(big.Int).SetBytes(a[:]) }
 
 // Hash converts an address to a hash by left-padding it with zeros.
 func (a Address) Hash() Hash { return BytesToHash(a[:]) }
